@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Steam Engine — Small-State Thesis</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div id="loading">
+        <div class="loader"></div>
+        <p>Training baseline model<span class="dots"></span></p>
+    </div>
+
+    <div id="app" class="hidden">
+        <header>
+            <div class="title-group">
+                <h1>STEAM ENGINE</h1>
+                <p class="subtitle">Small-State Thesis Interactive Demo</p>
+            </div>
+            <div class="header-right">
+                <div id="thesis-status" class="thesis-status">No compression applied</div>
+                <div class="header-actions">
+                    <button id="btn-reset" class="btn btn-ghost">Reset</button>
+                    <button id="btn-max" class="btn btn-ghost">Max Compress</button>
+                </div>
+            </div>
+        </header>
+
+        <section class="controls">
+            <div class="axis axis-bits">
+                <div class="axis-header">
+                    <h2>Bit-Width</h2>
+                    <span class="axis-desc">Precision per parameter</span>
+                </div>
+                <input type="range" id="bits-slider" min="0" max="6" step="1" value="0">
+                <div class="axis-value">
+                    <span id="bits-label">32-bit FP32</span>
+                    <span id="bits-comp" class="comp-badge">1x</span>
+                </div>
+            </div>
+
+            <div class="axis axis-latent">
+                <div class="axis-header">
+                    <h2>Latent Dim</h2>
+                    <span class="axis-desc">What is predicted</span>
+                </div>
+                <input type="range" id="latent-slider" min="0" max="7" step="1" value="0">
+                <div class="axis-value">
+                    <span id="latent-label">64 dimensions</span>
+                    <span id="latent-comp" class="comp-badge">1x</span>
+                </div>
+            </div>
+
+            <div class="axis axis-state">
+                <div class="axis-header">
+                    <h2>State Size</h2>
+                    <span class="axis-desc">What is remembered</span>
+                </div>
+                <input type="range" id="state-slider" min="0" max="7" step="1" value="0">
+                <div class="axis-value">
+                    <span id="state-label">16 tokens (full)</span>
+                    <span id="state-comp" class="comp-badge">1x</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="results">
+            <div class="metric-cards">
+                <div class="metric-card primary">
+                    <div class="metric-label">Accuracy</div>
+                    <div class="metric-value" id="accuracy">—</div>
+                    <div class="metric-sub" id="accuracy-sub">baseline: —</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Retained</div>
+                    <div class="metric-value" id="retained">—</div>
+                    <div class="metric-sub">of baseline quality</div>
+                </div>
+                <div class="metric-card accent">
+                    <div class="metric-label">Total Compression</div>
+                    <div class="metric-value" id="compression">—</div>
+                    <div class="metric-sub" id="comp-breakdown">—</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-label">Memory</div>
+                    <div class="metric-value" id="memory">—</div>
+                    <div class="metric-sub" id="memory-sub">baseline: —</div>
+                </div>
+            </div>
+        </section>
+
+        <section class="per-class">
+            <h3>Per-Class Accuracy</h3>
+            <div id="class-bars"></div>
+        </section>
+
+        <section class="charts">
+            <div class="chart-container">
+                <h3 class="chart-title">Bit-Width Sweep</h3>
+                <canvas id="chart-bits"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Latent Dim Sweep</h3>
+                <canvas id="chart-latent"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">State Size Sweep</h3>
+                <canvas id="chart-state"></canvas>
+            </div>
+            <div class="chart-container">
+                <h3 class="chart-title">Weight Distribution</h3>
+                <canvas id="chart-weights"></canvas>
+            </div>
+        </section>
+
+        <section class="samples">
+            <h3>Live Predictions</h3>
+            <div id="sample-list"></div>
+        </section>
+
+        <footer>
+            <p><strong>Small-state thesis</strong>: high-dimensional structure survives brutal information cuts.</p>
+            <p class="footer-sub">Three orthogonal compression axes applied to a sequence-pattern classifier (44K params, 5 classes, 16-step sequences).</p>
+        </footer>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
