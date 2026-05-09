@@ -6,6 +6,7 @@ FastAPI server: trains model on startup, serves compression API + frontend.
 import os
 import threading
 from contextlib import asynccontextmanager
+from typing import List, Literal
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -36,25 +37,50 @@ class EvalRequest(BaseModel):
     bits: float = 32
     latent_ratio: float = 1.0
     state_ratio: float = 1.0
+    mode: Literal["classify", "predict", "both"] = "both"
+
+
+class PredictRequest(BaseModel):
+    sequence: List[float]
+    bits: float = 32
+    latent_ratio: float = 1.0
+    state_ratio: float = 1.0
 
 
 @app.get("/api/status")
 def status():
-    return {"ready": engine.ready, "baseline": engine.baseline, "params": engine.n_params}
+    return {
+        "ready": engine.ready,
+        "baseline": engine.baseline,
+        "baseline_pred_mse": engine.baseline_pred_mse,
+        "baseline_latent_mse": engine.baseline_latent_mse,
+        "params": engine.n_params,
+    }
 
 
 @app.post("/api/evaluate")
 def evaluate(req: EvalRequest):
     if not engine.ready:
         return {"error": "Model still training"}
-    return engine.evaluate(req.bits, req.latent_ratio, req.state_ratio)
+    return engine.evaluate(req.bits, req.latent_ratio, req.state_ratio, mode=req.mode)
+
+
+@app.post("/api/predict")
+def predict(req: PredictRequest):
+    if not engine.ready:
+        return {"error": "Model still training"}
+    return engine.predict(req.sequence, req.bits, req.latent_ratio, req.state_ratio)
 
 
 @app.get("/api/sweeps")
 def sweeps():
     if not engine.ready:
         return {"error": "Model still training"}
-    return engine.sweeps
+    return {
+        "classify": engine.sweeps,
+        "predict": engine.pred_sweeps,
+        "latent": engine.latent_sweeps,
+    }
 
 
 @app.get("/")

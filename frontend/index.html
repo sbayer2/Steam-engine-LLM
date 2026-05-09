@@ -10,7 +10,7 @@
 <body>
     <div id="loading">
         <div class="loader"></div>
-        <p>Training baseline model<span class="dots"></span></p>
+        <p>Training dual-head model<span class="dots"></span></p>
     </div>
 
     <div id="app" class="hidden">
@@ -20,6 +20,11 @@
                 <p class="subtitle">Small-State Thesis Interactive Demo</p>
             </div>
             <div class="header-right">
+                <div class="mode-toggle" id="mode-toggle">
+                    <button data-mode="classify" class="mode-btn">Classify</button>
+                    <button data-mode="predict" class="mode-btn">Predict</button>
+                    <button data-mode="both" class="mode-btn active">Both</button>
+                </div>
                 <div id="thesis-status" class="thesis-status">No compression applied</div>
                 <div class="header-actions">
                     <button id="btn-reset" class="btn btn-ghost">Reset</button>
@@ -58,9 +63,9 @@
                     <h2>State Size</h2>
                     <span class="axis-desc">What is remembered</span>
                 </div>
-                <input type="range" id="state-slider" min="0" max="7" step="1" value="0">
+                <input type="range" id="state-slider" min="0" max="9" step="1" value="0">
                 <div class="axis-value">
-                    <span id="state-label">16 tokens (full)</span>
+                    <span id="state-label">64 tokens (full)</span>
                     <span id="state-comp" class="comp-badge">1x</span>
                 </div>
             </div>
@@ -68,15 +73,48 @@
 
         <section class="results">
             <div class="metric-cards">
-                <div class="metric-card primary">
+                <div class="metric-card primary" id="card-class">
                     <div class="metric-label">Accuracy</div>
                     <div class="metric-value" id="accuracy">—</div>
                     <div class="metric-sub" id="accuracy-sub">baseline: —</div>
                 </div>
-                <div class="metric-card">
-                    <div class="metric-label">Retained</div>
+                <div class="metric-card primary-pred" id="card-pred">
+                    <div class="metric-label">Prediction MSE</div>
+                    <div class="metric-stack">
+                        <div class="metric-row">
+                            <span class="metric-tag tag-raw">RAW</span>
+                            <span class="metric-value-sm" id="pred-mse">—</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-tag tag-latent">LATENT</span>
+                            <span class="metric-value-sm" id="pred-latent-mse">—</span>
+                        </div>
+                    </div>
+                    <div class="metric-sub" id="pred-mse-sub">base raw / lat: — / —</div>
+                </div>
+                <div class="metric-card" id="card-retained">
+                    <div class="metric-label">Class Retained</div>
                     <div class="metric-value" id="retained">—</div>
-                    <div class="metric-sub">of baseline quality</div>
+                    <div class="metric-sub" id="retained-sub">of baseline accuracy</div>
+                </div>
+                <div class="metric-card" id="card-pred-retained">
+                    <div class="metric-label">Pred Retained</div>
+                    <div class="metric-stack">
+                        <div class="metric-row">
+                            <span class="metric-tag tag-raw">RAW</span>
+                            <span class="metric-value-sm" id="pred-retained">—</span>
+                        </div>
+                        <div class="metric-row">
+                            <span class="metric-tag tag-latent">LATENT</span>
+                            <span class="metric-value-sm" id="pred-latent-retained">—</span>
+                        </div>
+                    </div>
+                    <div class="metric-sub">of each baseline</div>
+                </div>
+                <div class="metric-card divergence" id="card-divergence">
+                    <div class="metric-label">Divergence</div>
+                    <div class="metric-value" id="divergence">—</div>
+                    <div class="metric-sub" id="divergence-sub">latent_ret − raw_ret</div>
                 </div>
                 <div class="metric-card accent">
                     <div class="metric-label">Total Compression</div>
@@ -91,8 +129,11 @@
             </div>
         </section>
 
-        <section class="per-class">
-            <h3>Per-Class Accuracy</h3>
+        <section class="per-class" id="per-class-section">
+            <div class="per-class-header">
+                <h3>Per-Class Performance</h3>
+                <div class="legend" id="per-class-legend"></div>
+            </div>
             <div id="class-bars"></div>
         </section>
 
@@ -116,13 +157,13 @@
         </section>
 
         <section class="samples">
-            <h3>Live Predictions</h3>
+            <h3 id="samples-title">Live Predictions</h3>
             <div id="sample-list"></div>
         </section>
 
         <footer>
             <p><strong>Small-state thesis</strong>: high-dimensional structure survives brutal information cuts.</p>
-            <p class="footer-sub">Three orthogonal compression axes applied to a sequence-pattern classifier (44K params, 5 classes, 16-step sequences).</p>
+            <p class="footer-sub">Toy v2 triple-head Phase 3 model: classification (10 patterns) + raw prediction (next 16 values) + latent-space prediction (JEPA-style). Three orthogonal compression axes; ~51K params shared across heads. Divergence index = latent_retained − raw_retained.</p>
         </footer>
     </div>
 
