@@ -239,9 +239,17 @@ def quantize(model: nn.Module, bits: float):
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 TINYSHAKESPEARE_URL = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+PRIDE_PREJUDICE_URL = "https://www.gutenberg.org/cache/epub/1342/pg1342.txt"
+
+# Phase 4 Step 1.5: three-corpus predictability gradient.
+# Shakespeare (theatrical verse) — distinctive register, rich vocab, oscillatory.
+# Pride and Prejudice (Austen prose) — modern narrative prose, controlled vocab.
+# Code (Python source from this project) — highly structured, syntactic constraints.
+CORPUS_NAMES = ["shakespeare", "austen", "code"]
 
 
 def load_tinyshakespeare() -> str:
+    """Load TinyShakespeare (single-corpus mode, backward compat)."""
     os.makedirs(DATA_DIR, exist_ok=True)
     path = os.path.join(DATA_DIR, "tinyshakespeare.txt")
     if not os.path.exists(path):
@@ -251,6 +259,63 @@ def load_tinyshakespeare() -> str:
         return f.read()
 
 
+def _gutenberg_strip(text: str) -> str:
+    """Trim Project Gutenberg header/footer markers from a downloaded file."""
+    start = text.find("*** START OF THE PROJECT GUTENBERG")
+    end = text.find("*** END OF THE PROJECT GUTENBERG")
+    if start != -1 and end != -1:
+        content = text[start:end].split("\n", 1)[1]
+        return content.strip()
+    return text
+
+
+def load_pride_prejudice() -> str:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    path = os.path.join(DATA_DIR, "pride_and_prejudice.txt")
+    if not os.path.exists(path):
+        print(f"  Fetching Pride and Prejudice → {path}")
+        urllib.request.urlretrieve(PRIDE_PREJUDICE_URL, path)
+        with open(path, "r") as f:
+            text = f.read()
+        with open(path, "w") as f:
+            f.write(_gutenberg_strip(text))
+    with open(path, "r") as f:
+        return f.read()
+
+
+def load_code_corpus() -> str:
+    """Load Python source from this project as a code corpus.
+
+    Reproducible because the source files travel with the repo. If files are
+    missing (running outside the repo), returns an empty string and the caller
+    can drop the code corpus.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    sources = [
+        "engine.py", "main.py", "text_engine.py",
+        "tests/batch_a_seed_sensitivity.py", "tests/batch_phase3_v2.py",
+        "tests/batch_phase3_beta_sweep.py", "tests/batch_phase4_text_seeds.py",
+        "tests/batch_b_alpha_sweep.py", "tests/batch_c_latent_fine_sweep.py",
+        "tests/batch_d_smoothness_prototype.py",
+    ]
+    chunks = []
+    for rel in sources:
+        path = os.path.join(here, rel)
+        if os.path.exists(path):
+            with open(path) as f:
+                chunks.append(f.read())
+    return "\n\n# ----- next file -----\n\n".join(chunks)
+
+
+def load_all_corpora() -> dict[str, str]:
+    """Returns {corpus_name: raw_text} for the three multi-corpus regime."""
+    return {
+        "shakespeare": load_tinyshakespeare(),
+        "austen": load_pride_prejudice(),
+        "code": load_code_corpus(),
+    }
+
+
 def make_batches(data: torch.Tensor, batch_size: int, seq_len: int, rng: np.random.RandomState):
     """Random crops of length seq_len from a 1-D token tensor."""
     n = len(data) - seq_len - 1
@@ -258,6 +323,15 @@ def make_batches(data: torch.Tensor, batch_size: int, seq_len: int, rng: np.rand
     x = torch.stack([data[s:s + seq_len] for s in starts])
     y = torch.stack([data[s + 1:s + seq_len + 1] for s in starts])
     return x, y
+
+
+def make_multi_corpus_batches(corpora_data: dict, batch_size: int, seq_len: int,
+                              rng: np.random.RandomState):
+    """Sample a batch from one randomly-chosen corpus. Returns (x, y, corpus_name)."""
+    name = rng.choice(list(corpora_data.keys()))
+    data = corpora_data[name]
+    x, y = make_batches(data, batch_size, seq_len, rng)
+    return x, y, name
 
 
 # -----------------------------------------------------------------------------
@@ -270,9 +344,15 @@ class TextEngine:
         self.tokenizer: Optional[CharTokenizer] = None
         self.train_data: Optional[torch.Tensor] = None
         self.val_data: Optional[torch.Tensor] = None
+        # Multi-corpus state (Phase 4 Step 1.5). When multi-corpus mode is on,
+        # train_data / val_data become dicts {corpus_name: tensor}.
+        self.multi_corpus = False
+        self.corpora_train: Optional[dict[str, torch.Tensor]] = None
+        self.corpora_val: Optional[dict[str, torch.Tensor]] = None
         self.baseline_loss = float("inf")
         self.baseline_perplexity = float("inf")
         self.baseline_latent_mse = 1.0
+        self.baseline_per_corpus = {}        # {name: {loss, ppl, latent_mse}}
         self.sweeps = {}            # raw next-token: loss + perplexity per axis point
         self.latent_sweeps = {}     # latent prediction MSE per axis point
         self.ready = False
@@ -282,19 +362,33 @@ class TextEngine:
               seq_len: int = 256, epochs: int = 200, batch_size: int = 32,
               steps_per_epoch: int = 32, warmup_frac: float = 0.30,
               lr: float = 3e-4, model_seed: Optional[int] = None,
-              aug_seed: int = 7, beta: float = 0.5):
+              aug_seed: int = 7, beta: float = 0.5, multi_corpus: bool = False):
         t0 = time.time()
         if model_seed is not None:
             torch.manual_seed(model_seed)
 
-        text = load_tinyshakespeare()
-        self.tokenizer = CharTokenizer(text)
-        n_chars = len(text)
-        # 90/10 train/val split on contiguous text
-        split = int(n_chars * 0.9)
-        train_text, val_text = text[:split], text[split:]
-        self.train_data = torch.tensor(self.tokenizer.encode(train_text), dtype=torch.long)
-        self.val_data = torch.tensor(self.tokenizer.encode(val_text), dtype=torch.long)
+        self.multi_corpus = multi_corpus
+        if multi_corpus:
+            corpora = load_all_corpora()
+            corpora = {k: v for k, v in corpora.items() if v}  # drop empty corpora
+            joint_text = "\n".join(corpora.values())
+            self.tokenizer = CharTokenizer(joint_text)
+            self.corpora_train = {}
+            self.corpora_val = {}
+            for name, text in corpora.items():
+                tokens = torch.tensor(self.tokenizer.encode(text), dtype=torch.long)
+                split = int(len(tokens) * 0.9)
+                self.corpora_train[name] = tokens[:split]
+                self.corpora_val[name] = tokens[split:]
+                print(f"  corpus {name}: train={len(self.corpora_train[name])}, val={len(self.corpora_val[name])}")
+        else:
+            text = load_tinyshakespeare()
+            self.tokenizer = CharTokenizer(text)
+            n_chars = len(text)
+            split = int(n_chars * 0.9)
+            train_text, val_text = text[:split], text[split:]
+            self.train_data = torch.tensor(self.tokenizer.encode(train_text), dtype=torch.long)
+            self.val_data = torch.tensor(self.tokenizer.encode(val_text), dtype=torch.long)
 
         self.cfg = TextConfig(
             n_layer=n_layer, n_embd=n_embd, n_head=n_head,
@@ -322,7 +416,10 @@ class TextEngine:
                         latent_mask = torch.zeros(n_embd)
                         latent_mask[:keep] = 1.0
 
-                x, y = make_batches(self.train_data, batch_size, seq_len, rng)
+                if self.multi_corpus:
+                    x, y, _ = make_multi_corpus_batches(self.corpora_train, batch_size, seq_len, rng)
+                else:
+                    x, y = make_batches(self.train_data, batch_size, seq_len, rng)
                 opt.zero_grad()
 
                 # Online compressed pass: LM loss + predicted latent
@@ -357,6 +454,8 @@ class TextEngine:
             self.baseline_loss = val_loss
             self.baseline_perplexity = math.exp(val_loss)
             self.baseline_latent_mse = val_latent_mse
+            if self.multi_corpus:
+                self.baseline_per_corpus = self.per_corpus_metrics(self.model)
 
         elapsed = time.time() - t0
         print(
@@ -364,6 +463,9 @@ class TextEngine:
             f"ppl {self.baseline_perplexity:.2f} | lat_mse {self.baseline_latent_mse:.4f} | "
             f"{self.n_params:,} params"
         )
+        if self.multi_corpus:
+            for name, m in self.baseline_per_corpus.items():
+                print(f"    {name:>12}  ppl={m['perplexity']:.2f}  lat_mse={m['latent_mse']:.4f}")
 
         self._compute_sweeps()
         self.ready = True
@@ -375,32 +477,53 @@ class TextEngine:
             "vocab_size": self.tokenizer.vocab_size,
         }
 
-    def _compute_val_metrics(self, model: TextGPT, window=None, latent_mask=None,
-                             n_batches: int = 16, batch_size: int = 32) -> tuple[float, float]:
-        """Compute (mean LM loss, mean latent MSE) on validation data.
-
-        Latent MSE is computed against the UNCOMPRESSED teacher (self.model), as in
-        synthetic Phase 3 — the asymmetric setup is the point. Pass `model=self.model`
-        for baseline; pass a compressed deepcopy for compressed evaluation.
-        """
-        rng = np.random.RandomState(123)
+    def _val_metrics_on(self, model: TextGPT, val_data: torch.Tensor,
+                        window=None, latent_mask=None,
+                        n_batches: int = 16, batch_size: int = 32,
+                        rng_seed: int = 123) -> tuple[float, float]:
+        """Compute (mean LM loss, mean latent MSE) on a specific val tensor."""
+        rng = np.random.RandomState(rng_seed)
         seq_len = self.cfg.seq_len
         losses, latent_mses = [], []
         with torch.no_grad():
             for _ in range(n_batches):
-                x, y = make_batches(self.val_data, batch_size, seq_len, rng)
+                x, y = make_batches(val_data, batch_size, seq_len, rng)
                 _, hidden, loss = model(x, window=window, latent_mask=latent_mask, targets=y)
                 losses.append(loss.item())
-
                 h_ctx = hidden[:, PRED_CTX - 1, :]
                 pred_latent = model.latent_pred_head(h_ctx)
-                # Target latent always from uncompressed teacher (self.model), regardless
-                # of which model we're evaluating. Asymmetric setup matches synthetic Phase 3.
+                # Target latent always from uncompressed teacher (self.model)
                 _, target_hidden, _ = self.model(x)
                 z_target = target_hidden[:, PRED_CTX:PRED_CTX + PRED_LEN, :].mean(1)
                 latent_mses.append(F.mse_loss(pred_latent, z_target).item())
-
         return sum(losses) / len(losses), sum(latent_mses) / len(latent_mses)
+
+    def _compute_val_metrics(self, model: TextGPT, window=None, latent_mask=None,
+                             n_batches: int = 16, batch_size: int = 32) -> tuple[float, float]:
+        """Aggregate val metrics. In multi-corpus mode, averages equally across corpora."""
+        if self.multi_corpus:
+            losses, mses = [], []
+            for name, val_tensor in self.corpora_val.items():
+                lo, mse = self._val_metrics_on(model, val_tensor, window, latent_mask,
+                                               n_batches // max(len(self.corpora_val), 1), batch_size)
+                losses.append(lo)
+                mses.append(mse)
+            return sum(losses) / len(losses), sum(mses) / len(mses)
+        return self._val_metrics_on(model, self.val_data, window, latent_mask, n_batches, batch_size)
+
+    def per_corpus_metrics(self, model: TextGPT, window=None, latent_mask=None,
+                           n_batches: int = 8, batch_size: int = 32) -> dict:
+        """Returns {corpus_name: {loss, perplexity, latent_mse}} for the given model state.
+        Only meaningful when self.multi_corpus is True.
+        """
+        if not self.multi_corpus or not self.corpora_val:
+            return {}
+        out = {}
+        for name, val_tensor in self.corpora_val.items():
+            lo, mse = self._val_metrics_on(model, val_tensor, window, latent_mask,
+                                           n_batches, batch_size, rng_seed=hash(name) % 10000)
+            out[name] = {"loss": lo, "perplexity": math.exp(lo), "latent_mse": mse}
+        return out
 
     def _apply_compression(self, bits, latent_ratio, state_ratio):
         m = copy.deepcopy(self.model)
@@ -435,7 +558,7 @@ class TextEngine:
         # negative = latent worse than raw (H_D, what synthetic Phase 3 found).
         divergence_index = latent_retained - ppl_retained
 
-        return {
+        result = {
             "loss": round(loss, 4),
             "perplexity": round(perplexity, 4),
             "baseline_loss": round(self.baseline_loss, 4),
@@ -456,6 +579,29 @@ class TextEngine:
             },
             "settings": {"bits": bits, "latent_dim": active, "window": window},
         }
+
+        # Per-corpus retained metrics (Phase 4 Step 1.5). Same compression applied,
+        # eval split by corpus. Tests whether different corpora land in different
+        # H_A/H_D regimes at identical compression.
+        if self.multi_corpus and self.baseline_per_corpus:
+            current_per_corpus = self.per_corpus_metrics(m, window=window, latent_mask=lm)
+            per_corpus = {}
+            for name, base in self.baseline_per_corpus.items():
+                cur = current_per_corpus.get(name, {})
+                if not cur:
+                    continue
+                ppl_ret = base["perplexity"] / max(cur["perplexity"], 1e-6)
+                lat_ret = base["latent_mse"] / max(cur["latent_mse"], 1e-6)
+                per_corpus[name] = {
+                    "perplexity": round(cur["perplexity"], 4),
+                    "perplexity_retained": round(ppl_ret, 4),
+                    "latent_mse": round(cur["latent_mse"], 4),
+                    "latent_retained": round(lat_ret, 4),
+                    "divergence_index": round(lat_ret - ppl_ret, 4),
+                }
+            result["per_corpus"] = per_corpus
+
+        return result
 
     def generate(self, prompt: str, max_new: int = 200, temperature: float = 1.0,
                  bits: float = 32.0, latent_ratio: float = 1.0, state_ratio: float = 1.0):

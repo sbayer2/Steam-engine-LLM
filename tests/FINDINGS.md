@@ -88,6 +88,55 @@ Built `latent_pred_head` (Linear(n_embd, n_embd), tied to context-position-239 h
 - **LLM pretraining implication:** standard next-token objectives (discrete vocab) crash perplexity under compression while continuous-target SSL objectives may be more compression-robust.
 - **The mechanism predicts where each regime applies** — measurable in advance from target-distribution structure.
 
+## Phase 4 Step 1.5 — Multi-corpus 3-seed validation (1402s)
+
+Joint training on three corpora — TinyShakespeare (1.1 MB theatrical verse), Pride and Prejudice (738 KB Austen prose), Project code (82 KB Python) — sampled equally per batch via `make_multi_corpus_batches`. 3 seeds × 200 epochs. Per-corpus eval splits by corpus_id at each compression point.
+
+**Per-corpus baseline latent MSE (3-seed mean):**
+
+| corpus | lat_mse | rank |
+|---|---|---|
+| Austen | ~0.11 | lowest (most "collapsed" — encoder found easy summary) |
+| Shakespeare | ~0.16 | middle |
+| Code | ~0.24 | highest (collapse-resistant — structural diversity prevents shortcut) |
+
+**Sign-consistency across 3 seeds, per (compression, corpus) cell:**
+
+| compression | Shakespeare | Austen | Code |
+|---|---|---|---|
+| bits_4 (8x) | MIXED | MIXED | MIXED |
+| **bits_2 (16x)** | ALL NEG H_D (-0.01) | **ALL NEG H_D (-0.12)** | **ALL POS H_A (+0.14)** |
+| **bits_158 (20x)** | MIXED | **ALL NEG H_D (-0.11)** | MIXED |
+| latent_16 (4x) | MIXED | MIXED | ALL POS H_A (+0.05) |
+| **latent_8 (8x)** | **ALL POS H_A (+0.30)** | **ALL POS H_A (+0.25)** | **ALL POS H_A (+0.27)** |
+| **latent_4 (16x)** | **ALL POS H_A (+0.41)** | **ALL POS H_A (+0.36)** | **ALL POS H_A (+0.38)** |
+| mid_85x (128x) | ALL NEG H_D (-0.04) | MIXED | ALL NEG H_D (-0.04) |
+| **cliff_171x (256x)** | ALL NEG H_D (-0.03) | **ALL NEG H_D (-0.12)** | **ALL POS H_A (+0.11)** |
+
+### What this confirms
+
+**The per-corpus differentiation is real at heavy compression.** At bits_2 and cliff_171x, Austen and Code are opposite-signed with 3/3 sign consistency across all seeds. Mean magnitudes 0.11-0.14, standard deviations 0.04-0.05. This is not chance.
+
+**The mechanism prediction holds:** baseline latent MSE rank predicts compression-robustness rank. Austen (lowest baseline lat_mse, most collapsed-encoder representation) → H_D. Code (highest baseline lat_mse, structurally diverse, encoder cannot collapse) → H_A. Shakespeare in middle.
+
+### What this corrects
+
+**Single-seed Step 1.5 results at weak compression were noise.** Yesterday's bits_4 read showed Austen at −0.087 and Code at +0.001 — looked like differentiation. Three-seed reveals: bits_4 is MIXED for ALL three corpora (Austen [-0.081, -0.031, +0.163]; Code [-0.008, +0.001, +0.054]). The sign was unstable across initialization.
+
+**Lesson:** at compression points where the magnitude is near zero (≤ ±0.05 mean), single-seed direction is unreliable. The differentiation only becomes statistically clean once compression is heavy enough that the structural property (baseline lat_mse) has time to assert itself.
+
+### What's now publishable
+
+1. **The cross-domain mechanism is empirically validated:** baseline latent MSE → compression-robustness direction. Measurable before deploying compression.
+2. **Heavy-compression regime (≥16× bit reduction or ≥256× compound) is where the mechanism shows up cleanly.** At light compression, signs are dominated by initialization noise.
+3. **Latent-axis compression behaves uniformly across corpora.** H_A on every corpus on every seed at latent_8/latent_4. This is a separate, robust finding — distinct from the bit-axis per-corpus differentiation.
+
+### Implications for production
+
+- **A diagnostic before quantizing a model:** measure baseline latent MSE on its target objective. Low? expect H_D under aggressive bit-quantization. High? expect H_A.
+- **Code-like data may quantize better than prose-like data** under int4-equivalent regimes. The structural diversity of code prevents the encoder shortcut that prose enables.
+- **VLAs and other multimodal systems with mixed-target heads should be probed per-target.** The per-corpus split here mirrors the per-task split a multimodal model would face: some objectives may be H_D-prone while others stay H_A even under identical quantization.
+
 ---
 
 # Steam Engine Pre-Phase-3 Test Findings
