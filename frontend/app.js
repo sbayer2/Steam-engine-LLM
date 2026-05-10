@@ -1,8 +1,16 @@
 const BIT_LEVELS = [32, 16, 8, 4, 2, 1.58, 1];
 const BIT_LABELS = ['32-bit FP32', '16-bit FP16', '8-bit INT8', '4-bit INT4', '2-bit INT2', '1.58-bit Ternary', '1-bit Binary'];
 const LATENT_DIMS = [64, 48, 32, 16, 8, 4, 2, 1];
-const WINDOW_SIZES = [64, 48, 32, 24, 16, 12, 8, 4, 2, 1];
-const SEQ_LEN = 64;
+// Synthetic Toy v2 (SEQ_LEN=64)
+const WINDOW_SIZES_SYNTH = [64, 48, 32, 24, 16, 12, 8, 4, 2, 1];
+const SEQ_LEN_SYNTH = 64;
+// Text Phase 4 (SEQ_LEN=256)
+const WINDOW_SIZES_TEXT = [256, 192, 128, 96, 64, 32, 16, 8, 4];
+const SEQ_LEN_TEXT = 256;
+
+let WINDOW_SIZES = WINDOW_SIZES_SYNTH;
+let SEQ_LEN = SEQ_LEN_SYNTH;
+
 const PATTERNS = ['Arithmetic', 'Geometric', 'Quadratic', 'Exponential', 'Fibonacci', 'AR1', 'Periodic', 'Damped', 'RandomWalk', 'Random'];
 const PATTERN_COLORS = ['#58a6ff', '#3fb950', '#f0883e', '#ff7b72', '#d2a8ff', '#79c0ff', '#ffa657', '#7ee787', '#a5a5a5', '#8b949e'];
 
@@ -12,8 +20,12 @@ const COLOR_LATENT = '#d2a8ff';
 
 let charts = {};
 let sweepCache = null;
+let textSweepCache = null;
 let lastEval = null;
+let lastTextEval = null;
 let mode = 'both';
+let engine = 'synthetic';      // Phase 4: 'synthetic' or 'text'
+let textTrainingPolling = null;
 let debounceTimer = null;
 
 Chart.defaults.color = '#8b949e';
@@ -32,8 +44,11 @@ async function pollUntilReady() {
         if (data.ready) {
             document.getElementById('loading').classList.add('hidden');
             document.getElementById('app').classList.remove('hidden');
+            document.body.dataset.engine = 'synthetic';
             setupControls();
             setupModeToggle();
+            setupEngineTabs();
+            setupTextControls();
             applyMode();
             await loadSweeps();
             await evaluate();
@@ -41,6 +56,321 @@ async function pollUntilReady() {
         }
     } catch (e) {}
     setTimeout(pollUntilReady, 600);
+}
+
+function setupEngineTabs() {
+    document.querySelectorAll('.engine-tab').forEach(btn => {
+        btn.addEventListener('click', () => switchEngine(btn.dataset.engine));
+    });
+}
+
+function switchEngine(target) {
+    if (engine === target) return;
+    engine = target;
+    document.body.dataset.engine = target;
+    document.querySelectorAll('.engine-tab').forEach(b => b.classList.toggle('active', b.dataset.engine === target));
+
+    if (target === 'text') {
+        // Switch slider ranges to text constants
+        WINDOW_SIZES = WINDOW_SIZES_TEXT;
+        SEQ_LEN = SEQ_LEN_TEXT;
+        document.getElementById('state-slider').max = WINDOW_SIZES.length - 1;
+        document.getElementById('state-slider').value = 0;
+        // Hide synthetic-specific charts, samples
+        // Check text engine status
+        checkTextStatus();
+    } else {
+        WINDOW_SIZES = WINDOW_SIZES_SYNTH;
+        SEQ_LEN = SEQ_LEN_SYNTH;
+        document.getElementById('state-slider').max = WINDOW_SIZES.length - 1;
+        document.getElementById('state-slider').value = 0;
+        updateLabels();
+        evaluate();
+    }
+}
+
+function setupTextControls() {
+    document.getElementById('btn-train-text').addEventListener('click', startTextTraining);
+    document.getElementById('btn-generate').addEventListener('click', generateText);
+}
+
+async function startTextTraining() {
+    const res = await fetch('/api/text/start_training', { method: 'POST' });
+    const data = await res.json();
+    document.getElementById('text-status-msg').textContent = data.message + '. Polling status...';
+    document.getElementById('btn-train-text').disabled = true;
+    if (textTrainingPolling) clearInterval(textTrainingPolling);
+    textTrainingPolling = setInterval(checkTextStatus, 3000);
+}
+
+async function checkTextStatus() {
+    try {
+        const res = await fetch('/api/text/status');
+        const data = await res.json();
+        const msg = document.getElementById('text-status-msg');
+        if (data.ready) {
+            if (textTrainingPolling) {
+                clearInterval(textTrainingPolling);
+                textTrainingPolling = null;
+            }
+            const corpora = data.corpora || [];
+            msg.innerHTML = `<strong>Text engine ready.</strong> Params: ${data.params.toLocaleString()}. Baseline ppl: ${data.baseline_perplexity}. Latent MSE: ${data.baseline_latent_mse}. Corpora: ${corpora.join(', ')}.`;
+            document.getElementById('btn-train-text').disabled = true;
+            document.getElementById('btn-train-text').textContent = 'Trained ✓';
+            document.getElementById('btn-generate').disabled = false;
+            await loadTextSweeps();
+            await evaluateText();
+        } else if (data.training) {
+            msg.textContent = `Training in progress... elapsed ${data.elapsed_s ?? 0}s of ~480s expected. Polling every 3s.`;
+        } else {
+            msg.textContent = 'Click "Train Text Engine" to start (~8 min on CPU).';
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+async function loadTextSweeps() {
+    const res = await fetch('/api/text/sweeps');
+    textSweepCache = await res.json();
+    if (textSweepCache.error) return;
+    redrawTextSweeps();
+}
+
+async function evaluateText() {
+    if (!document.getElementById('btn-generate').disabled === false && engine !== 'text') return;
+    const settings = getTextSettings();
+    const res = await fetch('/api/text/evaluate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(settings),
+    });
+    const data = await res.json();
+    if (data.error) return;
+    lastTextEval = data;
+    renderTextMetrics(data);
+    redrawTextSweeps();
+    updateThesisStatusText(data);
+}
+
+function getTextSettings() {
+    const bi = +document.getElementById('bits-slider').value;
+    const li = +document.getElementById('latent-slider').value;
+    const si = +document.getElementById('state-slider').value;
+    return {
+        bits: BIT_LEVELS[bi],
+        latent_ratio: LATENT_DIMS[li] / 64,
+        state_ratio: WINDOW_SIZES_TEXT[si] / SEQ_LEN_TEXT,
+    };
+}
+
+function renderTextMetrics(data) {
+    const el = (id) => document.getElementById(id);
+    // Repurpose the metric cards for text: ppl in pred-mse slot, latent_mse in latent slot.
+    el('accuracy').textContent = data.perplexity.toFixed(2);
+    el('accuracy').style.color = ppColor(data.perplexity, data.baseline_perplexity);
+    el('accuracy-sub').textContent = 'baseline ppl: ' + data.baseline_perplexity.toFixed(2);
+
+    el('pred-mse').textContent = data.perplexity.toFixed(2);
+    el('pred-latent-mse').textContent = data.latent_mse.toFixed(3);
+    el('pred-mse-sub').textContent = 'base ppl / lat: ' + data.baseline_perplexity.toFixed(2) + ' / ' + data.baseline_latent_mse.toFixed(3);
+
+    el('retained').textContent = (data.perplexity_retained * 100).toFixed(1) + '%';
+    el('retained').style.color = accColor(Math.min(data.perplexity_retained, 1));
+    el('retained-sub').textContent = 'of baseline perplexity';
+
+    el('pred-retained').textContent = (data.perplexity_retained * 100).toFixed(1) + '%';
+    el('pred-latent-retained').textContent = (data.latent_retained * 100).toFixed(1) + '%';
+
+    const di = data.divergence_index;
+    const sign = di >= 0 ? '+' : '';
+    el('divergence').textContent = sign + (di * 100).toFixed(1) + '%';
+    el('divergence').style.color = di >= 0.05 ? '#3fb950' : (di > -0.05 ? '#8b949e' : '#f0883e');
+    el('divergence-sub').textContent = di >= 0.1 ? 'JEPA wins (H_A)'
+        : (di <= -0.1 ? 'latent worse (H_D)' : 'roughly equal');
+
+    el('compression').textContent = data.compression.total + 'x';
+    el('comp-breakdown').textContent =
+        'bits ' + data.compression.bits + 'x · latent ' + data.compression.latent + 'x · state ' + data.compression.state + 'x';
+
+    el('memory').textContent = data.memory_kb < 10
+        ? data.memory_kb.toFixed(2) + ' KB'
+        : data.memory_kb.toFixed(1) + ' KB';
+    el('memory-sub').textContent = 'baseline: ' + data.baseline_kb.toFixed(1) + ' KB';
+
+    // Per-corpus breakdown rendered into the per-class section
+    renderPerCorpusBars(data);
+}
+
+function renderPerCorpusBars(data) {
+    const container = document.getElementById('class-bars');
+    container.innerHTML = '';
+    const pc = data.per_corpus || {};
+    const corpora = Object.keys(pc);
+    if (corpora.length === 0) {
+        container.innerHTML = '<div style="color:var(--text-dim);font-size:0.8rem">No multi-corpus data — single-corpus mode</div>';
+        return;
+    }
+    // Header
+    const legend = document.getElementById('per-class-legend');
+    legend.innerHTML =
+        `<span class="legend-item"><span class="legend-dot" style="background:${COLOR_PRED}"></span>Ppl Retained</span>` +
+        `<span class="legend-item"><span class="legend-dot" style="background:${COLOR_LATENT}"></span>Lat Retained</span>`;
+
+    corpora.forEach(name => {
+        const m = pc[name];
+        const ppPct = (Math.min(m.perplexity_retained, 1) * 100).toFixed(1);
+        const latPct = (Math.min(m.latent_retained, 1) * 100).toFixed(1);
+        const div = m.divergence_index;
+        const divSign = div >= 0 ? '+' : '';
+        const divColor = div > 0.05 ? '#3fb950' : (div < -0.05 ? '#f0883e' : 'var(--text-dim)');
+
+        const row = document.createElement('div');
+        row.className = 'class-bar';
+        row.innerHTML =
+            '<span class="class-name">' + name + '</span>' +
+            '<div class="class-track"><div class="class-fill" style="width:' + ppPct + '%;background:' + COLOR_PRED + '"></div></div>' +
+            '<span class="class-pct">' + ppPct + '%</span>' +
+            '<div class="class-track"><div class="class-fill" style="width:' + latPct + '%;background:' + COLOR_LATENT + '"></div></div>' +
+            '<span class="class-pct">' + latPct + '%</span>' +
+            '<span class="class-pct" style="color:' + divColor + '">' + divSign + (div * 100).toFixed(1) + '%</span>';
+        container.appendChild(row);
+    });
+
+    // Update section header
+    document.querySelector('.per-class-header h3').textContent = 'Per-Corpus Performance';
+}
+
+function ppColor(ppl, basePpl) {
+    const ratio = ppl / Math.max(basePpl, 1e-6);
+    if (ratio <= 1.2) return '#3fb950';
+    if (ratio <= 2.0) return '#d29922';
+    if (ratio <= 4.0) return '#f0883e';
+    return '#f85149';
+}
+
+function updateThesisStatusText(data) {
+    const el = document.getElementById('thesis-status');
+    const comp = data.compression.total;
+    const ret = data.perplexity_retained;
+    if (comp <= 1.1) {
+        el.textContent = 'No compression applied';
+        el.style.color = 'var(--text-dim)';
+    } else if (ret >= 0.7) {
+        el.textContent = comp + 'x compressed — text fluency holds';
+        el.style.color = 'var(--success)';
+    } else if (ret >= 0.3) {
+        el.textContent = comp + 'x compressed — fluency degrading';
+        el.style.color = 'var(--warning)';
+    } else {
+        el.textContent = comp + 'x compressed — generation broken';
+        el.style.color = 'var(--danger)';
+    }
+}
+
+async function generateText() {
+    const btn = document.getElementById('btn-generate');
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+    try {
+        const settings = getTextSettings();
+        const body = {
+            prompt: document.getElementById('text-prompt').value,
+            max_new: +document.getElementById('text-max-new').value,
+            temperature: +document.getElementById('text-temp').value,
+            ...settings,
+        };
+        const res = await fetch('/api/text/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        document.getElementById('text-output').textContent = data.text || data.error;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = 'Generate at current compression';
+    }
+}
+
+function redrawTextSweeps() {
+    if (!textSweepCache || textSweepCache.error) return;
+    ['bits', 'latent', 'state'].forEach(axis => {
+        const id = 'chart-' + axis;
+        if (charts[axis]) {
+            charts[axis].destroy();
+            charts[axis] = null;
+        }
+        charts[axis] = makeTextSweepChart(id, axis);
+    });
+}
+
+function makeTextSweepChart(canvasId, axis) {
+    const raw = textSweepCache.raw[axis];
+    const lat = textSweepCache.latent[axis];
+    const xTitle = axis === 'bits' ? 'Bits' : axis === 'latent' ? 'Dims' : 'Window';
+    const labels = raw.map(d => {
+        if (axis === 'bits') return d.x + 'b';
+        if (axis === 'latent') return d.x + 'd';
+        return 'w' + d.x;
+    });
+
+    return new Chart(document.getElementById(canvasId), {
+        type: 'line',
+        data: {
+            labels,
+            datasets: [
+                {
+                    label: 'Perplexity',
+                    data: raw.map(d => d.perplexity),
+                    borderColor: COLOR_PRED,
+                    backgroundColor: 'rgba(240,136,62,0.08)',
+                    fill: false, tension: 0.3, pointRadius: 3,
+                    pointBackgroundColor: COLOR_PRED, yAxisID: 'y',
+                    borderDash: [4, 3],
+                },
+                {
+                    label: 'Latent MSE',
+                    data: lat.map(d => d.mse),
+                    borderColor: COLOR_LATENT,
+                    backgroundColor: 'rgba(210,168,255,0.08)',
+                    fill: false, tension: 0.3, pointRadius: 3,
+                    pointBackgroundColor: COLOR_LATENT, yAxisID: 'y1',
+                    borderDash: [2, 2],
+                },
+            ],
+        },
+        options: {
+            responsive: true, maintainAspectRatio: true, animation: { duration: 0 },
+            plugins: {
+                legend: {
+                    display: true,
+                    labels: { color: '#8b949e', font: { size: 9 }, boxWidth: 8 },
+                },
+            },
+            scales: {
+                x: {
+                    title: { display: true, text: xTitle, color: '#8b949e', font: { size: 9 } },
+                    ticks: { color: '#8b949e', font: { size: 8 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                },
+                y: {
+                    position: 'left',
+                    title: { display: true, text: 'Perplexity', color: COLOR_PRED, font: { size: 9 } },
+                    type: 'logarithmic',
+                    ticks: { color: '#8b949e', font: { size: 8 } },
+                    grid: { color: 'rgba(255,255,255,0.04)' },
+                },
+                y1: {
+                    position: 'right',
+                    title: { display: true, text: 'Latent MSE', color: COLOR_LATENT, font: { size: 9 } },
+                    min: 0,
+                    ticks: { color: '#8b949e', font: { size: 8 } },
+                    grid: { drawOnChartArea: false },
+                },
+            },
+        },
+    });
 }
 
 function setupControls() {
@@ -56,7 +386,8 @@ function setupControls() {
         document.getElementById('latent-slider').value = 0;
         document.getElementById('state-slider').value = 0;
         updateLabels();
-        evaluate();
+        if (engine === 'text') evaluateText();
+        else evaluate();
     });
 
     document.getElementById('btn-max').addEventListener('click', () => {
@@ -64,7 +395,8 @@ function setupControls() {
         document.getElementById('latent-slider').value = LATENT_DIMS.length - 1;
         document.getElementById('state-slider').value = WINDOW_SIZES.length - 1;
         updateLabels();
-        evaluate();
+        if (engine === 'text') evaluateText();
+        else evaluate();
     });
 
     updateLabels();
@@ -148,7 +480,13 @@ function getSettings() {
 
 function debouncedEvaluate() {
     clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(evaluate, 100);
+    debounceTimer = setTimeout(() => {
+        if (engine === 'text') {
+            evaluateText();
+        } else {
+            evaluate();
+        }
+    }, 100);
 }
 
 async function evaluate() {

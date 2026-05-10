@@ -14,13 +14,18 @@
     </div>
 
     <div id="app" class="hidden">
+        <div class="engine-tabs">
+            <button class="engine-tab active" data-engine="synthetic">Synthetic Toy v2</button>
+            <button class="engine-tab" data-engine="text">Text (Phase 4)</button>
+        </div>
+
         <header>
             <div class="title-group">
                 <h1>STEAM ENGINE</h1>
                 <p class="subtitle">Small-State Thesis Interactive Demo</p>
             </div>
             <div class="header-right">
-                <div class="mode-toggle" id="mode-toggle">
+                <div class="mode-toggle synthetic-only" id="mode-toggle">
                     <button data-mode="classify" class="mode-btn">Classify</button>
                     <button data-mode="predict" class="mode-btn">Predict</button>
                     <button data-mode="both" class="mode-btn active">Both</button>
@@ -156,14 +161,39 @@
             </div>
         </section>
 
-        <section class="samples">
+        <section class="samples synthetic-only">
             <h3 id="samples-title">Live Predictions</h3>
             <div id="sample-list"></div>
         </section>
 
+        <section class="text-status text-only">
+            <div class="text-status-inner">
+                <div id="text-status-msg">Click "Train Text Engine" to start training (~8 min on CPU). Trains a char-level GPT jointly on Shakespeare + Austen + project-code.</div>
+                <button id="btn-train-text" class="btn btn-accent">Train Text Engine</button>
+            </div>
+        </section>
+
+        <section class="text-gen text-only">
+            <h3>Live Text Generation</h3>
+            <div class="text-gen-controls">
+                <textarea id="text-prompt" rows="2" placeholder="Prompt...">ROMEO:&#10;</textarea>
+                <div class="text-gen-buttons">
+                    <label>tokens
+                        <input type="number" id="text-max-new" value="200" min="20" max="500" step="20">
+                    </label>
+                    <label>temp
+                        <input type="number" id="text-temp" value="0.8" min="0.1" max="2.0" step="0.1">
+                    </label>
+                    <button id="btn-generate" class="btn btn-accent" disabled>Generate at current compression</button>
+                </div>
+            </div>
+            <pre id="text-output">(text appears here)</pre>
+        </section>
+
         <footer>
             <p><strong>Small-state thesis</strong>: high-dimensional structure survives brutal information cuts.</p>
-            <p class="footer-sub">Toy v2 triple-head Phase 3 model: classification (10 patterns) + raw prediction (next 16 values) + latent-space prediction (JEPA-style). Three orthogonal compression axes; ~51K params shared across heads. Divergence index = latent_retained − raw_retained.</p>
+            <p class="footer-sub synthetic-only">Toy v2 triple-head Phase 3 model: classification (10 patterns) + raw prediction (next 16 values) + latent-space prediction (JEPA-style). Three orthogonal compression axes; ~51K params shared across heads. Divergence index = latent_retained − raw_retained.</p>
+            <p class="footer-sub text-only">Phase 4 Step 2: char-level GPT (~127K params, 2 layers, n_embd=64) trained jointly on Shakespeare + Austen + project-code. Cross-domain finding: text shows H_A (latent prediction more compression-robust than next-token) where synthetic Toy v2 showed H_D — driven by baseline latent MSE rank.</p>
         </footer>
     </div>
 
