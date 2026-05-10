@@ -270,12 +270,15 @@ function updateThesisStatusText(data) {
 
 async function generateText() {
     const btn = document.getElementById('btn-generate');
+    const out = document.getElementById('text-output');
     btn.disabled = true;
     btn.textContent = 'Generating...';
+    out.textContent = '(generating...)';   // immediate visual reset
     try {
+        const prompt = document.getElementById('text-prompt').value;
         const settings = getTextSettings();
         const body = {
-            prompt: document.getElementById('text-prompt').value,
+            prompt,
             max_new: +document.getElementById('text-max-new').value,
             temperature: +document.getElementById('text-temp').value,
             ...settings,
@@ -286,7 +289,16 @@ async function generateText() {
             body: JSON.stringify(body),
         });
         const data = await res.json();
-        document.getElementById('text-output').textContent = data.text || data.error;
+        if (data.error) {
+            out.textContent = data.error;
+        } else {
+            // Backend returns full sequence (prompt + generation). Strip the
+            // prompt so each click shows only the freshly-generated text.
+            const generated = data.text.startsWith(prompt)
+                ? data.text.slice(prompt.length)
+                : data.text;
+            out.textContent = generated;
+        }
     } finally {
         btn.disabled = false;
         btn.textContent = 'Generate at current compression';
