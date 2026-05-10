@@ -53,6 +53,12 @@ BIT_LEVELS = [32, 16, 8, 4, 2, 1.58, 1]
 LATENT_DIMS = [64, 48, 32, 16, 8, 4, 2, 1]   # ratios of n_embd
 WINDOW_SIZES = [256, 192, 128, 96, 64, 32, 16, 8, 4]  # ratios of seq_len
 
+# Phase 4 Step 2: latent prediction split — first PRED_CTX tokens form the context,
+# next PRED_LEN tokens form the future whose latent representation we predict.
+# 240/16 keeps the same 25% horizon ratio as synthetic Toy v2 (48/16 of 64).
+PRED_CTX = 240
+PRED_LEN = 16
+
 
 # -----------------------------------------------------------------------------
 # Char-level tokenizer
@@ -155,6 +161,12 @@ class TextGPT(nn.Module):
         # tie weights — saves params, matches nanoGPT/nanochat pattern
         self.lm_head.weight = self.tok_emb.weight
 
+        # Phase 4 Step 2: latent prediction head. Maps the encoder's hidden state
+        # at the last context position to a predicted latent representation of the
+        # future tokens (which the target encoder produces uncompressed).
+        # Single Linear keeps it minimal and matches the LM head's parameter cost.
+        self.latent_pred_head = nn.Linear(cfg.n_embd, cfg.n_embd)
+
         self.apply(self._init_weights)
 
     def _init_weights(self, module):
@@ -166,18 +178,21 @@ class TextGPT(nn.Module):
             nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, window=None, latent_mask=None, targets=None):
+        """Returns (logits, hidden, loss). hidden is the post-final-LN representation.
+        loss is None when targets is None.
+        """
         B, T = idx.shape
         pos = torch.arange(T, device=idx.device)
         x = self.tok_emb(idx) + self.pos_emb(pos)[None, :, :]
         for block in self.blocks:
             x = block(x, window=window, latent_mask=latent_mask)
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
+        hidden = self.ln_f(x)  # (B, T, n_embd)
+        logits = self.lm_head(hidden)
 
         if targets is None:
-            return logits, None
+            return logits, hidden, None
         loss = F.cross_entropy(logits.reshape(-1, self.cfg.vocab_size), targets.reshape(-1))
-        return logits, loss
+        return logits, hidden, loss
 
 
 # -----------------------------------------------------------------------------
@@ -257,7 +272,9 @@ class TextEngine:
         self.val_data: Optional[torch.Tensor] = None
         self.baseline_loss = float("inf")
         self.baseline_perplexity = float("inf")
-        self.sweeps = {}
+        self.baseline_latent_mse = 1.0
+        self.sweeps = {}            # raw next-token: loss + perplexity per axis point
+        self.latent_sweeps = {}     # latent prediction MSE per axis point
         self.ready = False
         self.n_params = 0
 
@@ -265,7 +282,7 @@ class TextEngine:
               seq_len: int = 256, epochs: int = 200, batch_size: int = 32,
               steps_per_epoch: int = 32, warmup_frac: float = 0.30,
               lr: float = 3e-4, model_seed: Optional[int] = None,
-              aug_seed: int = 7):
+              aug_seed: int = 7, beta: float = 0.5):
         t0 = time.time()
         if model_seed is not None:
             torch.manual_seed(model_seed)
@@ -307,7 +324,19 @@ class TextEngine:
 
                 x, y = make_batches(self.train_data, batch_size, seq_len, rng)
                 opt.zero_grad()
-                _, loss = self.model(x, window=window, latent_mask=latent_mask, targets=y)
+
+                # Online compressed pass: LM loss + predicted latent
+                _, hidden, ce_loss = self.model(x, window=window, latent_mask=latent_mask, targets=y)
+                h_ctx = hidden[:, PRED_CTX - 1, :]                          # (B, n_embd)
+                pred_latent = self.model.latent_pred_head(h_ctx)             # (B, n_embd)
+
+                # Target encoder pass: same model, no compression, stop_grad
+                with torch.no_grad():
+                    _, target_hidden, _ = self.model(x)
+                    z_target = target_hidden[:, PRED_CTX:PRED_CTX + PRED_LEN, :].mean(1)  # (B, n_embd)
+
+                mse_latent = F.mse_loss(pred_latent, z_target)
+                loss = ce_loss + beta * mse_latent
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
                 opt.step()
@@ -324,14 +353,16 @@ class TextEngine:
 
         self.model.eval()
         with torch.no_grad():
-            val_loss = self._compute_val_loss(self.model)
+            val_loss, val_latent_mse = self._compute_val_metrics(self.model)
             self.baseline_loss = val_loss
             self.baseline_perplexity = math.exp(val_loss)
+            self.baseline_latent_mse = val_latent_mse
 
         elapsed = time.time() - t0
         print(
             f"  Trained in {elapsed:.1f}s | val loss {self.baseline_loss:.4f} | "
-            f"perplexity {self.baseline_perplexity:.2f} | {self.n_params:,} params"
+            f"ppl {self.baseline_perplexity:.2f} | lat_mse {self.baseline_latent_mse:.4f} | "
+            f"{self.n_params:,} params"
         )
 
         self._compute_sweeps()
@@ -339,21 +370,37 @@ class TextEngine:
         return {
             "baseline_loss": round(self.baseline_loss, 4),
             "baseline_perplexity": round(self.baseline_perplexity, 4),
+            "baseline_latent_mse": round(self.baseline_latent_mse, 4),
             "params": self.n_params,
             "vocab_size": self.tokenizer.vocab_size,
         }
 
-    def _compute_val_loss(self, model: TextGPT, window=None, latent_mask=None,
-                          n_batches: int = 16, batch_size: int = 32) -> float:
+    def _compute_val_metrics(self, model: TextGPT, window=None, latent_mask=None,
+                             n_batches: int = 16, batch_size: int = 32) -> tuple[float, float]:
+        """Compute (mean LM loss, mean latent MSE) on validation data.
+
+        Latent MSE is computed against the UNCOMPRESSED teacher (self.model), as in
+        synthetic Phase 3 — the asymmetric setup is the point. Pass `model=self.model`
+        for baseline; pass a compressed deepcopy for compressed evaluation.
+        """
         rng = np.random.RandomState(123)
         seq_len = self.cfg.seq_len
-        losses = []
+        losses, latent_mses = [], []
         with torch.no_grad():
             for _ in range(n_batches):
                 x, y = make_batches(self.val_data, batch_size, seq_len, rng)
-                _, loss = model(x, window=window, latent_mask=latent_mask, targets=y)
+                _, hidden, loss = model(x, window=window, latent_mask=latent_mask, targets=y)
                 losses.append(loss.item())
-        return sum(losses) / len(losses)
+
+                h_ctx = hidden[:, PRED_CTX - 1, :]
+                pred_latent = model.latent_pred_head(h_ctx)
+                # Target latent always from uncompressed teacher (self.model), regardless
+                # of which model we're evaluating. Asymmetric setup matches synthetic Phase 3.
+                _, target_hidden, _ = self.model(x)
+                z_target = target_hidden[:, PRED_CTX:PRED_CTX + PRED_LEN, :].mean(1)
+                latent_mses.append(F.mse_loss(pred_latent, z_target).item())
+
+        return sum(losses) / len(losses), sum(latent_mses) / len(latent_mses)
 
     def _apply_compression(self, bits, latent_ratio, state_ratio):
         m = copy.deepcopy(self.model)
@@ -370,7 +417,7 @@ class TextEngine:
     def evaluate(self, bits: float = 32.0, latent_ratio: float = 1.0, state_ratio: float = 1.0):
         m, lm, window, active = self._apply_compression(bits, latent_ratio, state_ratio)
         m.eval()
-        loss = self._compute_val_loss(m, window=window, latent_mask=lm)
+        loss, latent_mse = self._compute_val_metrics(m, window=window, latent_mask=lm)
         perplexity = math.exp(loss)
 
         eff_bits = min(bits, 32)
@@ -380,13 +427,25 @@ class TextEngine:
         lc = 1.0 / max(latent_ratio, 1 / self.cfg.n_embd)
         sc = self.cfg.seq_len / max(window, 1)
 
+        # Retained ratios — both should be ≤1 under compression (lower is worse for
+        # both perplexity and latent MSE, so baseline / current).
+        ppl_retained = self.baseline_perplexity / max(perplexity, 1e-6)
+        latent_retained = self.baseline_latent_mse / max(latent_mse, 1e-6)
+        # Divergence: positive = latent more robust than raw under compression (H_A);
+        # negative = latent worse than raw (H_D, what synthetic Phase 3 found).
+        divergence_index = latent_retained - ppl_retained
+
         return {
             "loss": round(loss, 4),
             "perplexity": round(perplexity, 4),
             "baseline_loss": round(self.baseline_loss, 4),
             "baseline_perplexity": round(self.baseline_perplexity, 4),
             "loss_retained": round(self.baseline_loss / max(loss, 1e-6), 4),
-            "perplexity_retained": round(self.baseline_perplexity / max(perplexity, 1e-6), 4),
+            "perplexity_retained": round(ppl_retained, 4),
+            "latent_mse": round(latent_mse, 4),
+            "baseline_latent_mse": round(self.baseline_latent_mse, 4),
+            "latent_retained": round(latent_retained, 4),
+            "divergence_index": round(divergence_index, 4),
             "memory_kb": round(mem_kb, 2),
             "baseline_kb": round(base_kb, 2),
             "compression": {
@@ -409,7 +468,7 @@ class TextEngine:
                 # crop context to seq_len from the right
                 ctx = idx[:, -self.cfg.seq_len:]
                 eff_window = min(window, ctx.shape[1])
-                logits, _ = m(ctx, window=eff_window, latent_mask=lm)
+                logits, _, _ = m(ctx, window=eff_window, latent_mask=lm)
                 logits = logits[:, -1, :] / max(temperature, 1e-6)
                 probs = F.softmax(logits, dim=-1)
                 next_tok = torch.multinomial(probs, num_samples=1)
@@ -420,16 +479,20 @@ class TextEngine:
         n_embd = self.cfg.n_embd
         seq_len = self.cfg.seq_len
         self.sweeps = {"bits": [], "latent": [], "state": []}
+        self.latent_sweeps = {"bits": [], "latent": [], "state": []}
         for b in BIT_LEVELS:
             r = self.evaluate(bits=b)
             self.sweeps["bits"].append({"x": b, "loss": r["loss"], "perplexity": r["perplexity"]})
+            self.latent_sweeps["bits"].append({"x": b, "mse": r["latent_mse"]})
         for d in LATENT_DIMS:
             r = self.evaluate(latent_ratio=d / n_embd)
             self.sweeps["latent"].append({"x": d, "loss": r["loss"], "perplexity": r["perplexity"]})
+            self.latent_sweeps["latent"].append({"x": d, "mse": r["latent_mse"]})
         for w in WINDOW_SIZES:
             r = self.evaluate(state_ratio=w / seq_len)
             self.sweeps["state"].append({"x": w, "loss": r["loss"], "perplexity": r["perplexity"]})
-        print("  Sweeps computed (loss + perplexity over 3 axes).")
+            self.latent_sweeps["state"].append({"x": w, "mse": r["latent_mse"]})
+        print("  Sweeps computed (raw loss/ppl + latent MSE over 3 axes).")
 
 
 # -----------------------------------------------------------------------------
