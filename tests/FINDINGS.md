@@ -1,3 +1,55 @@
+# Steam Engine Test Findings (Pre-Phase-3 + Phase 4 Step 1)
+
+## Phase 4 Step 1 — Text model first results (2026-05-09)
+
+Built `text_engine.py`, a minimal char-level GPT (2 layers, 64 embd, 4 heads, 256 seq_len, 65 vocab) trained on TinyShakespeare with the same compression-aware curriculum as synthetic Toy v2. 200 epochs in 284s on CPU. 120K params. Final val perplexity 9.16.
+
+**Three plateau-cliff replications across domains (synthetic → text):**
+
+### Bit-width axis — ternary rescue replicates
+
+| bits | loss | perplexity | retained |
+|---|---|---|---|
+| 32 / 16 / 8 | 2.22 | 9.16 | 1.00 (plateau) |
+| 4 | 2.71 | 14.95 | 0.61 |
+| 2 | 3.66 | 39.01 | 0.24 |
+| **1.58** | **2.89** | **18.03** | **0.51 (recovery)** |
+| 1 | 3.28 | 26.47 | 0.35 |
+
+The 1.58-bit > 2-bit > 1-bit ordering is preserved on text. Group-wise ternary scaling carries the recovery from synthetic to natural language. This is non-trivial — it confirms the group-wise quantization optimization is a genuine compression-favorable structure, not a synthetic-toy artifact.
+
+### Latent-dim axis — cliff at 8d, same as Toy v2
+
+| dims | perplexity |
+|---|---|
+| 64 / 48 / 32 | 9-10 (plateau) |
+| 16 | 12.4 (inflection) |
+| 8 | 34.3 (cliff) |
+| 4 / 2 / 1 | 111 / 380 / 603 (catastrophic) |
+
+Cliff position at 8d on text exactly matches Toy v2's latent cliff at 8d. Suggests the cliff is bottleneck-capacity-driven, not task-specific.
+
+### State-window axis — even flatter than synthetic
+
+| window | perplexity |
+|---|---|
+| 256 → 32 | ~9.2 (zero degradation) |
+| 16 | 9.20 |
+| 8 | 9.46 |
+| 4 | 10.66 (still small) |
+
+Char-level prediction is heavily local; 2-layer model has limited long-range capacity. **The state window can shrink 64× with no measurable loss.** Implication for Mamba-style small-state architectures: there's room to compress context drastically when the task is local.
+
+### Compound compression
+
+- 128× (4-bit, 32d, w=32): perplexity 12.4, retained 0.74 (plateau)
+- 256× (2-bit, 32d, w=32): perplexity 47, retained 0.19 (cliff)
+- 524288× (1-bit, 1d, 1-token): perplexity 245, retained 0.04 (degenerate)
+
+**Step 1 verdict:** the framework transfers. Compression-aware curriculum doesn't destabilize text training. Ternary rescue, latent-cliff-at-8d, and state-axis-flatness all replicate. Phase 4 Step 2 (latent prediction head for the H_D test on text) is unblocked.
+
+---
+
 # Steam Engine Pre-Phase-3 Test Findings
 
 Tests run before Phase 3 implementation, to validate Phase 2 results and inform Phase 3 design choices. Each batch addresses a specific question about whether Phase 3's planned metrics will work.
