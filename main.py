@@ -112,7 +112,7 @@ def _train_text_engine_thread():
     import time
     text_engine_started_at = time.time()
     try:
-        text_engine.train(epochs=200, model_seed=0, aug_seed=0, beta=0.5, multi_corpus=True)
+        text_engine.train(epochs=200, model_seed=0, aug_seed=0, beta=0.5, multi_corpus=False, corpus="code")
     finally:
         with text_engine_lock:
             text_engine_training = False

@@ -284,17 +284,23 @@ def load_pride_prejudice() -> str:
 
 
 def load_code_corpus() -> str:
-    """Load Python source from this project as a code corpus.
+    """Load Python source code corpus.
 
-    Reproducible because the source files travel with the repo. If files are
-    missing (running outside the repo), returns an empty string and the caller
-    can drop the code corpus.
+    Prefers data/code_corpus.txt (larger, curated). Falls back to reading
+    source files directly if the data file is missing.
     """
     here = os.path.dirname(os.path.abspath(__file__))
+    corpus_file = os.path.join(here, "data", "code_corpus.txt")
+    if os.path.exists(corpus_file):
+        with open(corpus_file) as f:
+            return f.read()
+    # Fallback: read source files directly
     sources = [
         "engine.py", "main.py", "text_engine.py",
         "tests/batch_a_seed_sensitivity.py", "tests/batch_phase3_v2.py",
         "tests/batch_phase3_beta_sweep.py", "tests/batch_phase4_text_seeds.py",
+        "tests/batch_phase4_text_beta_sweep.py", "tests/batch_gradient_norm_probe.py",
+        "tests/batch_phase4_multi_corpus.py",
         "tests/batch_b_alpha_sweep.py", "tests/batch_c_latent_fine_sweep.py",
         "tests/batch_d_smoothness_prototype.py",
     ]
@@ -362,7 +368,14 @@ class TextEngine:
               seq_len: int = 256, epochs: int = 200, batch_size: int = 32,
               steps_per_epoch: int = 32, warmup_frac: float = 0.30,
               lr: float = 3e-4, model_seed: Optional[int] = None,
-              aug_seed: int = 7, beta: float = 0.5, multi_corpus: bool = False):
+              aug_seed: int = 7, beta: float = 0.5, multi_corpus: bool = False,
+              corpus: str = "shakespeare"):
+        """Train the text engine.
+
+        Args:
+            corpus: which single corpus to use when multi_corpus=False.
+                    "shakespeare" (default), "austen", or "code".
+        """
         t0 = time.time()
         if model_seed is not None:
             torch.manual_seed(model_seed)
@@ -382,7 +395,13 @@ class TextEngine:
                 self.corpora_val[name] = tokens[split:]
                 print(f"  corpus {name}: train={len(self.corpora_train[name])}, val={len(self.corpora_val[name])}")
         else:
-            text = load_tinyshakespeare()
+            loaders = {
+                "shakespeare": load_tinyshakespeare,
+                "austen": load_pride_prejudice,
+                "code": load_code_corpus,
+            }
+            loader = loaders.get(corpus, load_tinyshakespeare)
+            text = loader()
             self.tokenizer = CharTokenizer(text)
             n_chars = len(text)
             split = int(n_chars * 0.9)
